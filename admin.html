@@ -292,8 +292,11 @@ tbody td { padding:11px 14px; font-size:13px; vertical-align:middle; }
 <div id="toastContainer"></div>
 
 <script>
-const API_URL    = 'https://script.google.com/macros/s/AKfycbwocJsGoXNoWuPPjvz5e7rorhMXzEDHNdrYlkHvCVDQZPR_50s7N4uDD9J3SQlsrvjtig/exec';
-const ADMIN_PASS = 'NeverDoIt';
+const API_URL = 'https://script.google.com/macros/s/AKfycbwocJsGoXNoWuPPjvz5e7rorhMXzEDHNdrYlkHvCVDQZPR_50s7N4uDD9J3SQlsrvjtig/exec';
+// No password lives in client code anymore — see doLogin(). The server
+// checks the password once and hands back a short-lived session token,
+// which is what every subsequent admin call sends instead.
+function getToken() { return sessionStorage.getItem('tq_admin_token') || ''; }
 
 let allEvents      = {};   // { eventName: [students] }
 let eventNames     = [];
@@ -307,21 +310,55 @@ let sortDir        = 'asc';
 
 // ── LOGIN ──
 window.addEventListener('load', () => {
-  if (sessionStorage.getItem('tq_admin_login')) { showApp(); fetchAllData(); }
+  if (getToken()) { showApp(); fetchAllData(); }
 });
 
-function doLogin() {
+async function doLogin() {
   const pass = document.getElementById('passInput').value.trim();
   const err  = document.getElementById('loginErr');
+  const btn  = document.getElementById('loginBtn');
   err.style.display = 'none';
   if (!pass) { err.textContent = 'Please enter password'; err.style.display = 'block'; return; }
-  if (pass !== ADMIN_PASS) { err.textContent = 'Invalid password'; err.style.display = 'block'; return; }
-  sessionStorage.setItem('tq_admin_login', 'true');
+
+  btn.disabled = true;
+  const res = await fetchAPI(`${API_URL}?path=admin/login&password=${encodeURIComponent(pass)}`);
+  btn.disabled = false;
+
+  if (!res || !res.success || !res.token) {
+    err.textContent = 'Invalid password';
+    err.style.display = 'block';
+    return;
+  }
+  // Only the session token is stored — the password itself is never kept
+  // anywhere in the browser, and this call happens exactly once.
+  sessionStorage.setItem('tq_admin_token', res.token);
   showApp();
   fetchAllData();
 }
 
-function doLogout() { sessionStorage.removeItem('tq_admin_login'); location.reload(); }
+function doLogout() {
+  // Best-effort: ask the server to invalidate the token immediately
+  // rather than waiting for the 6-hour cache expiry.
+  nocorsAction({ path: 'admin/logout', token: getToken() });
+  sessionStorage.removeItem('tq_admin_token');
+  location.reload();
+}
+
+// If the server ever rejects our token (expired session, revoked, etc.)
+// drop back to the login screen instead of silently failing.
+function handleAuthFailure(res) {
+  // Only force a reload if we thought we had a valid session (a token was
+  // stored) and the server rejected it — e.g. it expired after 6 hours.
+  // A failed login attempt (no token stored yet) is handled inline by
+  // doLogin() instead, so we don't want to reload the page out from
+  // under the user while they're still typing their password.
+  if (res && res.error === 'Unauthorized' && getToken()) {
+    sessionStorage.removeItem('tq_admin_token');
+    location.reload();
+    return true;
+  }
+  return false;
+}
 
 function showApp() {
   document.getElementById('loginScreen').style.display = 'none';
@@ -333,7 +370,9 @@ function showApp() {
 async function fetchAPI(url) {
   try {
     const res = await fetch(url, { redirect: 'follow' });
-    return JSON.parse(await res.text());
+    const data = JSON.parse(await res.text());
+    if (handleAuthFailure(data)) return null;
+    return data;
   } catch(e) {
     console.error('fetchAPI error:', e);
     return null;
@@ -345,7 +384,10 @@ async function nocorsAction(params = {}) {
     const qs  = new URLSearchParams(params).toString();
     const res = await fetch(`${API_URL}?${qs}`, { redirect: 'follow' });
     const txt = await res.text();
-    try { return JSON.parse(txt); } catch(e) { return { success: true }; }
+    let data;
+    try { data = JSON.parse(txt); } catch(e) { return { success: true }; }
+    if (handleAuthFailure(data)) return null;
+    return data;
   } catch(e) {
     console.error('nocorsAction error:', e);
     return null;
@@ -357,7 +399,7 @@ async function fetchAllData() {
   const list = document.getElementById('eventsList');
   list.innerHTML = '<div class="empty-state"><span class="ei">⟳</span><small>Loading...</small></div>';
 
-  const data = await fetchAPI(`${API_URL}?path=admin/events&password=${ADMIN_PASS}`);
+  const data = await fetchAPI(`${API_URL}?path=admin/events&token=${getToken()}`);
   if (!data || data.error) {
     list.innerHTML = '<div class="empty-state">Failed to load events</div>';
     showToast('Failed to load event data', 'error');
@@ -381,7 +423,7 @@ async function refreshCurrentEvent() {
   if (!currentEvent) return;
   showToast('Refreshing event...', 'success');
 
-  const rows = await fetchAPI(`${API_URL}?path=admin/events&password=${ADMIN_PASS}&event=${encodeURIComponent(currentEvent)}`);
+  const rows = await fetchAPI(`${API_URL}?path=admin/events&token=${getToken()}&event=${encodeURIComponent(currentEvent)}`);
   if (!rows || rows.error) { showToast('Refresh failed', 'error'); return; }
 
   allEvents[currentEvent] = Array.isArray(rows) ? rows : [];
@@ -618,7 +660,7 @@ async function saveMarks(input) {
   if (dot) dot.style.display = 'inline-block';
 
   const res = await nocorsAction({
-    path: 'admin/marks', password: ADMIN_PASS,
+    path: 'admin/marks', token: getToken(),
     eventName: currentEvent, scholarNo: scholar, marks: val
   });
 
@@ -640,7 +682,7 @@ async function saveTeam(input) {
   const val     = input.value.trim();
 
   const res = await nocorsAction({
-    path: 'admin/teamname', password: ADMIN_PASS,
+    path: 'admin/teamname', token: getToken(),
     eventName: currentEvent, scholarNo: scholar, teamName: val
   });
 
@@ -663,7 +705,7 @@ async function toggleSelected(btn) {
   btn.textContent = 'Saving...';
 
   const res = await nocorsAction({
-    path: 'admin/selected', password: ADMIN_PASS,
+    path: 'admin/selected', token: getToken(),
     eventName: currentEvent, scholarNo: scholar, selected: newVal
   });
 
@@ -734,7 +776,7 @@ async function applyBulkMarks() {
   closeModal('markModal');
 
   const res = await nocorsAction({
-    path: 'admin/marks/batch', password: ADMIN_PASS,
+    path: 'admin/marks/batch', token: getToken(),
     eventName: currentEvent,
     scholarNos: scholars.join(','),
     marks: val
@@ -775,7 +817,7 @@ function confirmDelete() {
 async function doAutoRank() {
   closeModal('rankModal');
   const res = await nocorsAction({
-    path: 'admin/auto-rank', password: ADMIN_PASS,
+    path: 'admin/auto-rank', token: getToken(),
     eventName: currentEvent
   });
   if (res && res.success) {
